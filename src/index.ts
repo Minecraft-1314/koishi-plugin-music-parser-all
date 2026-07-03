@@ -475,8 +475,8 @@ function generateFormattedText(p: ParsedMusic, format: string): string {
     album: p.album,
     cover: p.cover,
     music_url: p.musicUrl,
-    level: p.level || '未知',
-    size: p.size || '未知',
+    level: p.level || '',
+    size: p.size || '',
   }
   const formatVarRegex = /\$\{([^}]+)\}/g
   const lines = format.split('\n')
