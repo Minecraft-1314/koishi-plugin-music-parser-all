@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-music-parser-all",
   "description": "Koishi 全平台音乐解析插件，支持网易云音乐/酷我音乐/QQ音乐/汽水音乐等平台",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

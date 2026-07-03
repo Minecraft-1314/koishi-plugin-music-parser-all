@@ -81,7 +81,7 @@ export const Config = Schema.intersect([
 
   Schema.object({
     unifiedMessageFormat: Schema.string().role('textarea').default(
-      '歌名：${name}\n歌手：${artist}\n专辑：${album}\n音质：${level}\n歌词：${lyric}'
+      '歌名：${name}\n歌手：${artist}\n专辑：${album}\n音质：${level}\n大小：${size}'
     ).description('文字格式，支持变量，空行自动隐藏'),
   }).description('消息格式'),
 
@@ -90,12 +90,11 @@ export const Config = Schema.intersect([
     showCoverImage: Schema.boolean().default(true).description('发送封面图片'),
     showMusicVoice: Schema.boolean().default(false).description('音乐链接以语音形式发送'),
     showMusicVoiceFile: Schema.boolean().default(true).description('音乐链接是否以语音形式发送（关闭则只发送链接）'),
-    forceDownloadMusicVoice: Schema.boolean().default(false).description('强制下载音乐语音'),
+    forceDownloadMusicVoice: Schema.boolean().default(true).description('强制下载音乐语音（推荐开启，避免链接失效）'),
     forceDownloadImage: Schema.boolean().default(false).description('强制下载封面图片'),
   }).description('媒体发送与音乐语音'),
 
   Schema.object({
-    maxLyricLength: Schema.number().min(0).step(1).default(500).description('歌词长度上限（0不限制）'),
     maxConcurrent: Schema.number().min(1).step(1).default(3).description('解析最大并发数'),
     downloadConcurrency: Schema.number().min(1).step(1).default(3).description('下载线程数'),
     mediaDownloadTimeout: Schema.number().min(0).step(1).default(120000).description('统一下载超时 (ms)'),
@@ -150,6 +149,76 @@ export const Config = Schema.intersect([
   }).description('缓存与临时文件'),
 
   Schema.object({
+    primaryApiUrl: Schema.string().default('https://api.bugpk.com/api/163_music').hidden(),
+    backupApiUrl: Schema.string().default('https://api.bugpk.com/api/music').hidden(),
+    platformDedicatedFirst: Schema.object({
+      netease: Schema.boolean().default(false).description('网易云音乐'),
+      kuwo: Schema.boolean().default(false).description('酷我音乐'),
+      qqmusic: Schema.boolean().default(false).description('QQ音乐'),
+      qishui: Schema.boolean().default(false).description('汽水音乐'),
+    }).description('优先使用专属 API'),
+    customApis: Schema.array(
+      Schema.object({
+        platform: Schema.union([
+          Schema.const('netease').description('网易云音乐'),
+          Schema.const('kuwo').description('酷我音乐'),
+          Schema.const('qqmusic').description('QQ音乐'),
+          Schema.const('qishui').description('汽水音乐'),
+        ]).description('平台'),
+        apiUrl: Schema.string().description('API 地址'),
+        apiKey: Schema.string().description('API Key').default(''),
+        authHeaderType: Schema.union([
+          Schema.const('Bearer').description('Bearer'),
+          Schema.const('X-API-Key').description('X-API-Key'),
+          Schema.const('Custom').description('自定义'),
+        ]).default('Bearer').description('认证头类型'),
+        customHeaderName: Schema.string().default('X-API-Key').description('自定义头名称'),
+        fieldMapping: Schema.string().role('textarea').default('{}').description('字段映射 JSON'),
+      })
+    ).default([]).description('覆盖内置平台 API'),
+    customPlatforms: Schema.array(
+      Schema.object({
+        name: Schema.string().required().description('平台名称'),
+        exampleUrl: Schema.string().description('示例链接'),
+        keywords: Schema.string().required().description('关键词（逗号分隔）'),
+        apiUrl: Schema.string().required().description('解析 API'),
+        apiKey: Schema.string().default('').description('API Key'),
+        authHeaderType: Schema.union([
+          Schema.const('Bearer').description('Bearer'),
+          Schema.const('X-API-Key').description('X-API-Key'),
+          Schema.const('Custom').description('自定义'),
+        ]).default('Bearer').description('认证头类型'),
+        customHeaderName: Schema.string().default('X-API-Key').description('自定义头名称'),
+        fieldMapping: Schema.string().role('textarea').default('{}').description('字段映射 JSON'),
+        proxy: Schema.object({
+          enabled: Schema.boolean().default(false).description('启用独立代理'),
+          protocol: Schema.union([
+            Schema.const('http').description('HTTP'),
+            Schema.const('https').description('HTTPS'),
+          ]).default('http').description('协议'),
+          host: Schema.string().default('127.0.0.1').description('地址'),
+          port: Schema.number().default(7890).description('端口'),
+          auth: Schema.object({
+            username: Schema.string().default('').description('用户名'),
+            password: Schema.string().default('').description('密码'),
+          }).description('认证'),
+        }).description('独立代理（覆盖全局代理）'),
+      })
+    ).default([]).description('自定义新平台'),
+    globalFieldMapping: Schema.string().role('textarea').default(
+      '{\n' +
+      '  "name": "data.name",\n' +
+      '  "artist": "data.ar_name",\n' +
+      '  "album": "data.al_name",\n' +
+      '  "cover": "data.pic",\n' +
+      '  "musicUrl": "data.url",\n' +
+      '  "level": "data.level",\n' +
+      '  "size": "data.size"\n' +
+      '}'
+    ).description('全局字段映射 JSON'),
+  }).description('API 与平台'),
+
+  Schema.object({
     waitingTipText: Schema.string().default('正在解析音乐，请稍候...').description('等待提示'),
     unsupportedPlatformText: Schema.string().default('暂不支持该平台音乐链接').description('不支持提示'),
     invalidLinkText: Schema.string().default('无效的音乐链接').description('无效链接提示'),
@@ -165,16 +234,33 @@ interface ParsedMusic {
   album: string
   cover: string
   musicUrl: string
-  lyric: string
   level?: string
   size?: string
-  duration?: number
 }
 
 interface LinkMatch {
   type: string
   url: string
   id: string
+}
+
+interface ApiItem {
+  url: string
+  label: string
+  apiKey?: string
+  authHeaderType?: string
+  customHeaderName?: string
+  fieldMapping?: Record<string, string>
+}
+
+interface CustomPlatformConfig {
+  name: string
+  apiUrl: string
+  apiKey: string
+  authHeaderType: string
+  customHeaderName: string
+  fieldMapping?: Record<string, string>
+  proxy?: any
 }
 
 const logger = new Logger(name)
@@ -185,14 +271,28 @@ function debugLog(level: string, ...args: any[]) {
 }
 
 const BUILTIN_LINK_RULES: { pattern: RegExp; type: string }[] = [
-  { pattern: /https?:\/\/(?:music\.163\.com\/(?:#\/)?song\?id=\d{3,}|163cn\.tv\/[A-Za-z0-9]+|y\.music\.163\.com\/m\/song\?id=\d{3,})[^\s]*/gi, type: 'netease' },
-  { pattern: /https?:\/\/www\.kuwo\.cn\/play_detail\/\d+[^\s]*/gi, type: 'kuwo' },
-  { pattern: /https?:\/\/y\.qq\.com\/n\/ryqq\/songDetail\/[A-Za-z0-9]+[^\s]*/gi, type: 'qqmusic' },
-  { pattern: /https?:\/\/i\.y\.qq\.com\/v8\/playsong\.html\?songid=\d+[^\s]*/gi, type: 'qqmusic' },
-  { pattern: /https?:\/\/qishui\.douyin\.com\/s\/[A-Za-z0-9]+[^\s]*/gi, type: 'qishui' },
+  { pattern: /https?:\/\/(?:music\.163\.com\/(?:#\/)?song\?id=(\d{3,})|163cn\.tv\/[A-Za-z0-9]+|y\.music\.163\.com\/m\/song\?id=(\d{3,}))/gi, type: 'netease' },
+  { pattern: /https?:\/\/www\.kuwo\.cn\/play_detail\/(\d+)/gi, type: 'kuwo' },
+  { pattern: /https?:\/\/y\.qq\.com\/n\/ryqq\/songDetail\/([A-Za-z0-9]+)/gi, type: 'qqmusic' },
+  { pattern: /https?:\/\/i\.y\.qq\.com\/v8\/playsong\.html\?songid=(\d+)/gi, type: 'qqmusic' },
+  { pattern: /https?:\/\/qishui\.douyin\.com\/s\/([A-Za-z0-9]+)/gi, type: 'qishui' },
 ]
 
-function linkTypeParser(content: string, customRules: { pattern: RegExp; type: string }[] = []): LinkMatch[] {
+function buildCustomLinkRules(customPlatforms: any[]): { pattern: RegExp; type: string }[] {
+  if (!Array.isArray(customPlatforms) || customPlatforms.length === 0) return []
+  return customPlatforms
+    .filter(p => p.keywords)
+    .map(p => {
+      const keywords = p.keywords.split(',').map((s: string) => s.trim()).filter(Boolean)
+      if (keywords.length === 0) return null
+      const escaped = keywords.map((k: string) => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      const pattern = new RegExp('https?://[^/\\s]*(' + escaped.join('|') + ')[^\\s]*', 'gi')
+      return { pattern, type: `custom_${p.name}` }
+    })
+    .filter(Boolean) as { pattern: RegExp; type: string }[]
+}
+
+function linkTypeParser(content: string, customRules: { pattern: RegExp; type: string }[]): LinkMatch[] {
   content = content.replace(/\\\//g, '/')
   const allRules = [...BUILTIN_LINK_RULES, ...customRules]
   const matches: LinkMatch[] = []
@@ -204,7 +304,8 @@ function linkTypeParser(content: string, customRules: { pattern: RegExp; type: s
       const url = match[0]
       if (seen.has(url)) continue
       seen.add(url)
-      matches.push({ type: rule.type, url, id: match[1] || url })
+      const id = match[1] || match[2] || url
+      matches.push({ type: rule.type, url, id })
     }
   }
   return matches
@@ -261,80 +362,110 @@ function cleanUrl(url: string): string {
   }
 }
 
-const API_ENDPOINTS: Record<string, string> = {
-  netease: 'https://api.bugpk.com/api/163_music',
-  kuwo: 'https://api.bugpk.com/api/kuwo',
-  qqmusic: 'https://api.bugpk.com/api/qqmusic',
-  qishui: 'https://api.bugpk.com/api/qsmusic',
+function parseFieldMapping(mappingStr: string): Record<string, string> | undefined {
+  if (!mappingStr || mappingStr.trim() === '{}' || mappingStr.trim() === '') return undefined
+  try {
+    const obj = JSON.parse(mappingStr)
+    if (typeof obj === 'object' && !Array.isArray(obj)) return obj
+    return undefined
+  } catch {
+    return undefined
+  }
 }
 
-async function fetchMusicApi(type: string, url: string, config: any, http: AxiosInstance): Promise<any> {
-  const apiUrl = API_ENDPOINTS[type]
-  if (!apiUrl) throw new Error(`不支持的平台: ${type}`)
-  const params: any = { url: cleanUrl(url) }
-  if (type === 'netease') params.type = 'json'
-  const res = await http.get(apiUrl, { params })
-  if (res.data && (res.data.code === 200 || res.data.code === 0)) {
-    return res.data.data
+function getNestedValue(obj: any, path: string): any {
+  if (!path) return obj
+  const keys = path.split('.')
+  let current = obj
+  for (const key of keys) {
+    if (current === null || current === undefined) return undefined
+    current = current[key]
   }
-  throw new Error(res.data?.msg || `API返回错误码: ${res.data?.code}`)
+  return current
 }
 
-function parseMusicResponse(rawData: any, type: string, maxLyricLen: number): ParsedMusic {
-  debugLog('DEBUG', `解析原始数据 [${type}]:`, rawData)
-  switch (type) {
-    case 'netease':
-      return {
-        type: 'netease',
-        name: rawData.name || '',
-        artist: rawData.ar_name || '',
-        album: rawData.al_name || '',
-        cover: rawData.pic || '',
-        musicUrl: rawData.url || '',
-        lyric: (rawData.lyric || '').slice(0, maxLyricLen),
-        level: rawData.level || '',
-        size: rawData.size || '',
-      }
-    case 'kuwo':
-      return {
-        type: 'kuwo',
-        name: rawData.title || '',
-        artist: rawData.artist || '',
-        album: rawData.album || '',
-        cover: rawData.pic || rawData.albumpic || '',
-        musicUrl: rawData.music_url || '',
-        lyric: (rawData.lyrics_url || '').slice(0, maxLyricLen),
-        level: '',
-        size: '',
-      }
-    case 'qqmusic':
-      return {
-        type: 'qqmusic',
-        name: rawData.name || '',
-        artist: rawData.author || '',
-        album: rawData.album || '',
-        cover: rawData.cover || '',
-        musicUrl: rawData.url || '',
-        lyric: (rawData.lrc_data || '').slice(0, maxLyricLen),
-        level: '',
-        size: '',
-      }
-    case 'qishui':
-      const cover = Array.isArray(rawData.artistsmedium_avatar_url) ? rawData.artistsmedium_avatar_url[0] : ''
-      return {
-        type: 'qishui',
-        name: rawData.albumname || '',
-        artist: rawData.artistsname || '',
-        album: rawData.albumname || '',
-        cover: cover,
-        musicUrl: rawData.url || '',
-        lyric: (rawData.lyric || '').slice(0, maxLyricLen),
-        level: rawData.Format || '',
-        size: rawData.Size || '',
-      }
-    default:
-      throw new Error('未知平台类型')
+function parseApiResponse(raw: any, type: string, fieldMapping?: Record<string, string>): ParsedMusic {
+  debugLog('DEBUG', 'API raw response', raw)
+  const data = raw?.data || raw
+
+  const mapField = (name: string, fallback: () => any) => {
+    if (fieldMapping && fieldMapping[name]) {
+      const value = getNestedValue(raw, fieldMapping[name])
+      if (value !== undefined) return value
+    }
+    return fallback()
   }
+
+  const name = mapField('name', () => {
+    switch (type) {
+      case 'netease': return data.name || data.ar_name || ''
+      case 'kuwo': return data.title || ''
+      case 'qqmusic': return data.name || ''
+      case 'qishui': return data.albumname || ''
+      default: return data.name || data.title || data.albumname || ''
+    }
+  })
+
+  const artist = mapField('artist', () => {
+    switch (type) {
+      case 'netease': return data.ar_name || ''
+      case 'kuwo': return data.artist || ''
+      case 'qqmusic': return data.author || ''
+      case 'qishui': return data.artistsname || ''
+      default: return data.ar_name || data.artist || data.author || data.artistsname || ''
+    }
+  })
+
+  const album = mapField('album', () => {
+    switch (type) {
+      case 'netease': return data.al_name || ''
+      case 'kuwo': return data.album || ''
+      case 'qqmusic': return data.album || ''
+      case 'qishui': return data.albumname || ''
+      default: return data.al_name || data.album || data.albumname || ''
+    }
+  })
+
+  const cover = mapField('cover', () => {
+    switch (type) {
+      case 'netease': return data.pic || ''
+      case 'kuwo': return data.pic || data.albumpic || ''
+      case 'qqmusic': return data.cover || ''
+      case 'qishui': {
+        const avatars = data.artistsmedium_avatar_url
+        return Array.isArray(avatars) ? avatars[0] || '' : ''
+      }
+      default: return data.pic || data.cover || ''
+    }
+  })
+
+  const musicUrl = mapField('musicUrl', () => {
+    switch (type) {
+      case 'netease': return data.url || ''
+      case 'kuwo': return data.music_url || ''
+      case 'qqmusic': return data.url || ''
+      case 'qishui': return data.url || ''
+      default: return data.url || data.music_url || ''
+    }
+  })
+
+  const level = mapField('level', () => {
+    switch (type) {
+      case 'netease': return data.level || ''
+      case 'qishui': return data.Format || ''
+      default: return data.level || data.Format || ''
+    }
+  })
+
+  const size = mapField('size', () => {
+    switch (type) {
+      case 'netease': return data.size || ''
+      case 'qishui': return data.Size || ''
+      default: return data.size || data.Size || ''
+    }
+  })
+
+  return { type, name, artist, album, cover, musicUrl, level, size }
 }
 
 function generateFormattedText(p: ParsedMusic, format: string): string {
@@ -344,7 +475,6 @@ function generateFormattedText(p: ParsedMusic, format: string): string {
     album: p.album,
     cover: p.cover,
     music_url: p.musicUrl,
-    lyric: p.lyric,
     level: p.level || '未知',
     size: p.size || '未知',
   }
@@ -358,7 +488,10 @@ function generateFormattedText(p: ParsedMusic, format: string): string {
       for (const match of varMatches) {
         const varName = match.slice(2, -1)
         const val = vars[varName]
-        if (val && val !== '0') { allEmpty = false; break }
+        if (val !== undefined && val !== '' && val !== '0') {
+          allEmpty = false
+          break
+        }
       }
       if (allEmpty) continue
     }
@@ -385,6 +518,14 @@ function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message
   if (error && typeof error === 'object' && 'message' in error) return String((error as Record<string, unknown>).message)
   return String(error)
+}
+
+function buildAuthHeaders(apiKey: string, authHeaderType: string, customHeaderName: string): Record<string, string> {
+  if (!apiKey) return {}
+  if (authHeaderType === 'Bearer') return { 'Authorization': `Bearer ${apiKey}` }
+  if (authHeaderType === 'X-API-Key') return { 'X-API-Key': apiKey }
+  if (authHeaderType === 'Custom' && customHeaderName) return { [customHeaderName]: apiKey }
+  return {}
 }
 
 export function apply(ctx: Context, config: any) {
@@ -432,10 +573,105 @@ export function apply(ctx: Context, config: any) {
     }
   }
 
+  const customPlatforms: CustomPlatformConfig[] = (config.customPlatforms || []).map((p: any) => ({
+    name: p.name,
+    apiUrl: p.apiUrl,
+    apiKey: p.apiKey || '',
+    authHeaderType: p.authHeaderType || 'Bearer',
+    customHeaderName: p.customHeaderName || 'X-API-Key',
+    fieldMapping: parseFieldMapping(p.fieldMapping),
+    proxy: p.proxy || null
+  }))
+
+  function getPlatformConfig(type: string): {
+    apiUrl: string | null
+    dedicatedFirst: boolean
+    apiKey: string
+    authHeaderType: string
+    customHeaderName: string
+    fieldMapping?: Record<string, string>
+    customProxy?: any
+  } {
+    if (type.startsWith('custom_')) {
+      const name = type.slice(7)
+      const custom = customPlatforms.find(p => p.name === name)
+      if (custom) {
+        return {
+          apiUrl: custom.apiUrl,
+          dedicatedFirst: true,
+          apiKey: custom.apiKey || '',
+          authHeaderType: custom.authHeaderType,
+          customHeaderName: custom.customHeaderName,
+          fieldMapping: custom.fieldMapping,
+          customProxy: custom.proxy
+        }
+      }
+      return { apiUrl: null, dedicatedFirst: false, apiKey: '', authHeaderType: 'Bearer', customHeaderName: 'X-API-Key' }
+    }
+
+    const custom = config.customApis?.find((item: any) => item.platform === type)
+    const defaultDedicatedApis: Record<string, string> = {
+      netease: 'https://api.bugpk.com/api/163_music',
+      kuwo: 'https://api.bugpk.com/api/kuwo',
+      qqmusic: 'https://api.bugpk.com/api/qqmusic',
+      qishui: 'https://api.bugpk.com/api/qsmusic',
+    }
+    let apiUrl = defaultDedicatedApis[type] || null
+    let apiKey = ''
+    let authHeaderType = 'Bearer'
+    let customHeaderName = 'X-API-Key'
+    let fieldMapping: Record<string, string> | undefined = undefined
+    if (custom && custom.apiUrl) {
+      apiUrl = custom.apiUrl
+      apiKey = custom.apiKey || ''
+      authHeaderType = custom.authHeaderType || 'Bearer'
+      customHeaderName = custom.customHeaderName || 'X-API-Key'
+      fieldMapping = parseFieldMapping(custom.fieldMapping)
+    }
+    const dedicatedFirst = config.platformDedicatedFirst?.[type] ?? false
+    if (!fieldMapping) {
+      fieldMapping = parseFieldMapping(config.globalFieldMapping)
+    }
+    return { apiUrl, dedicatedFirst, apiKey, authHeaderType, customHeaderName, fieldMapping }
+  }
+
+  const BACKUP_AGGREGATE_API = config.backupApiUrl || 'https://api.bugpk.com/api/music'
+
   async function downloadFile(url: string, timeout: number, maxSize: number, filePrefix: string, fileExts: string[]): Promise<string> {
     if (!url) throw new Error('链接为空')
     await fs.mkdir(cacheDir, { recursive: true })
-    const ext = fileExts.find(e => new RegExp('\\.' + e + '(\\?|$)', 'i').test(url)) || fileExts[0]
+
+    let ext = fileExts.find(e => new RegExp('\\.' + e + '(\\?|$)', 'i').test(url))
+    if (!ext) {
+      try {
+        const urlObj = new URL(url)
+        const mimeType = urlObj.searchParams.get('mime_type')
+        if (mimeType) {
+          const mimeMap: Record<string, string> = {
+            'audio_mp4': 'm4a',
+            'audio/mp4': 'm4a',
+            'audio_mpeg': 'mp3',
+            'audio/mpeg': 'mp3',
+            'audio_mp3': 'mp3',
+            'audio/mp3': 'mp3',
+            'audio_flac': 'flac',
+            'audio/flac': 'flac',
+            'audio_wav': 'wav',
+            'audio/wav': 'wav',
+            'audio_ogg': 'ogg',
+            'audio/ogg': 'ogg',
+            'audio_aac': 'aac',
+            'audio/aac': 'aac',
+          }
+          const mappedExt = mimeMap[mimeType]
+          if (mappedExt && fileExts.includes(mappedExt)) {
+            ext = mappedExt
+          }
+        }
+      } catch {}
+    }
+    ext = ext || fileExts[0]
+
     const fileName = `${filePrefix}_${Date.now()}_${randomBytes(4).toString('hex')}.${ext}`
     const filePath = path.resolve(cacheDir, fileName)
 
@@ -535,7 +771,7 @@ export function apply(ctx: Context, config: any) {
       const sendLink = async () => { await sendWithTimeout(session, `${type === 'audio' ? '音乐' : '封面'}链接：${url}`).catch(() => {}) }
       const extMap: Record<string, string[]> = {
         image: ['png', 'jpg', 'jpeg', 'gif', 'webp'],
-        audio: ['mp3', 'm4a', 'flac', 'wav', 'ogg', 'aac']
+        audio: ['mp3', 'm4a', 'flac', 'wav', 'ogg', 'aac', 'opus', 'wma', 'ape', 'wv', 'alac']
       }
       const prefixMap = { image: 'img', audio: 'music' }
       const sendFunc = type === 'audio' ? h.audio : h.image
@@ -578,6 +814,96 @@ export function apply(ctx: Context, config: any) {
     }
   }
 
+  async function fetchApi(url: string, type: string, matchId: string, fieldMapping?: Record<string, string>, platformConf?: any): Promise<ParsedMusic> {
+    const cacheKey = url
+    const cached = urlCacheLocal.get(cacheKey)
+    if (cached && cached.expire > Date.now()) return cached.data
+
+    const { apiUrl: dedicatedUrl, dedicatedFirst, apiKey, authHeaderType, customHeaderName, customProxy } = platformConf || getPlatformConfig(type)
+    const primaryApi = dedicatedUrl
+    const backupApis: ApiItem[] = []
+    if (type === 'netease' || type === 'qqmusic') {
+      backupApis.push({ url: BACKUP_AGGREGATE_API, label: '聚合备用API', fieldMapping })
+    }
+
+    const apiList: ApiItem[] = []
+    if (dedicatedFirst && primaryApi) {
+      apiList.push({ url: primaryApi, label: `专属API(${type})`, apiKey, authHeaderType, customHeaderName, fieldMapping })
+      apiList.push(...backupApis)
+    } else {
+      if (primaryApi) apiList.push({ url: primaryApi, label: `默认API(${type})`, apiKey, authHeaderType, customHeaderName, fieldMapping })
+      apiList.push(...backupApis)
+    }
+
+    const customHeaders = config.customHeaders || []
+    let lastError: Error | null = null
+    for (const api of apiList) {
+      for (let attempt = 0; attempt <= config.retryTimes; attempt++) {
+        try {
+          const headers: any = {
+            'User-Agent': config.userAgent,
+            'Referer': 'https://www.baidu.com/',
+          }
+          for (const h of customHeaders) {
+            if (h.name && h.value) headers[h.name] = h.value
+          }
+          if (api.apiKey) {
+            const authHeaders = buildAuthHeaders(api.apiKey, api.authHeaderType || 'Bearer', api.customHeaderName || 'X-API-Key')
+            Object.assign(headers, authHeaders)
+          }
+
+          let apiUrl = api.url
+          let params: any = {}
+          if (apiUrl === BACKUP_AGGREGATE_API) {
+            const media = type === 'netease' ? 'netease' : 'tencent'
+            params = { id: matchId, media, type: 'song' }
+          } else {
+            params = { url: cleanUrl(url) }
+            if (type === 'netease' && apiUrl.includes('163_music')) params.type = 'json'
+          }
+
+          const proxyToUse = customProxy && customProxy.enabled ? customProxy : (proxyConfig.enabled ? proxyConfig : undefined)
+          const axiosConfigLocal: AxiosRequestConfig = {
+            params,
+            timeout: config.timeout,
+            headers,
+            proxy: proxyToUse && proxyToUse.host ? {
+              protocol: proxyToUse.protocol || 'http',
+              host: proxyToUse.host,
+              port: proxyToUse.port || 7890,
+              auth: proxyToUse.auth?.username ? { username: proxyToUse.auth.username, password: proxyToUse.auth.password || '' } : undefined
+            } : undefined
+          }
+          const res = await http.get(apiUrl, axiosConfigLocal)
+          const rawData = res.data
+          if (rawData && (rawData.code === 200 || rawData.code === 0 || (apiUrl === BACKUP_AGGREGATE_API && rawData.url))) {
+            const parsed = parseApiResponse(rawData, type, api.fieldMapping)
+            urlCacheLocal.set(cacheKey, { data: parsed, expire: Date.now() + cacheTTL })
+            return parsed
+          }
+          throw new Error(rawData?.msg || `API返回错误码: ${rawData?.code}`)
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error))
+          debugLog('ERROR', `${api.label} attempt ${attempt+1} failed: ${lastError.message}`)
+          if (attempt < config.retryTimes) { await delay(config.retryInterval); continue }
+          break
+        }
+      }
+      debugLog('WARN', `${api.label} all retries failed`)
+    }
+    throw lastError || new Error('所有API请求全部失败')
+  }
+
+  async function processSingleUrl(url: string, type: string, matchId: string, fieldMapping?: Record<string, string>, platformConf?: any): Promise<{ success: true; data: { text: string; parsed: ParsedMusic } } | { success: false; msg: string; url: string }> {
+    try {
+      const parsed = await fetchApi(url, type, matchId, fieldMapping, platformConf)
+      const text = generateFormattedText(parsed, config.unifiedMessageFormat)
+      return { success: true, data: { text, parsed } }
+    } catch (error) {
+      return { success: false, msg: getErrorMessage(error), url }
+    }
+  }
+
   async function flush(session: any, matches: LinkMatch[]) {
     debugLog('INFO', `开始解析 ${matches.length} 个链接`)
     const items: { text: string; parsed: ParsedMusic }[] = []
@@ -587,7 +913,7 @@ export function apply(ctx: Context, config: any) {
       await limiter.acquire()
       try {
         const platformEnabled = config.platformEnabled?.[match.type] ?? true
-        if (!platformEnabled) {
+        if (!platformEnabled && !match.type.startsWith('custom_')) {
           debugLog('INFO', `平台 ${match.type} 已禁用，跳过链接: ${match.url}`)
           return
         }
@@ -595,13 +921,12 @@ export function apply(ctx: Context, config: any) {
           const lastTime = dedupCache.get(match.url)
           if (lastTime && (Date.now() - lastTime < config.deduplicationInterval * 1000)) {
             debugLog('INFO', `跳过重复链接: ${match.url}`)
-            const shortUrl = match.url.length > 50 ? match.url.slice(0, 50) + '...' : match.url
-            await sendWithTimeout(session, `链接 ${shortUrl} 在最近 ${config.deduplicationInterval} 秒内已解析过，已跳过。`).catch(() => {})
             return
           }
         }
         debugLog('INFO', `解析链接: ${match.url} (${match.type})`)
-        const result = await processSingleUrl(match.url, match.type)
+        const platformConf = getPlatformConfig(match.type)
+        const result = await processSingleUrl(match.url, match.type, match.id, platformConf.fieldMapping, platformConf)
         if (result.success) {
           if (config.deduplicationInterval > 0) {
             const fp = contentFingerprint(result.data.parsed)
@@ -667,31 +992,6 @@ export function apply(ctx: Context, config: any) {
     debugLog('INFO', '处理完成')
   }
 
-  async function processSingleUrl(url: string, type: string): Promise<{ success: true; data: { text: string; parsed: ParsedMusic } } | { success: false; msg: string; url: string }> {
-    const cacheKey = url
-    const cached = urlCacheLocal.get(cacheKey)
-    if (cached && cached.expire > Date.now()) {
-      const text = generateFormattedText(cached.data, config.unifiedMessageFormat)
-      return { success: true, data: { text, parsed: cached.data } }
-    }
-
-    for (let attempt = 0; attempt <= config.retryTimes; attempt++) {
-      try {
-        const data = await fetchMusicApi(type, url, config, http)
-        const parsed = parseMusicResponse(data, type, config.maxLyricLength)
-        urlCacheLocal.set(cacheKey, { data: parsed, expire: Date.now() + cacheTTL })
-        const text = generateFormattedText(parsed, config.unifiedMessageFormat)
-        return { success: true, data: { text, parsed } }
-      } catch (error) {
-        const errMsg = getErrorMessage(error)
-        debugLog('ERROR', `解析尝试 ${attempt+1} 失败: ${errMsg}`)
-        if (attempt < config.retryTimes) await delay(config.retryInterval)
-        else return { success: false, msg: errMsg, url }
-      }
-    }
-    return { success: false, msg: texts.unsupportedPlatformText, url }
-  }
-
   async function sendWithTimeout(session: any, content: any, customRetries?: number): Promise<any> {
     const maxRetries = customRetries ?? config.retryTimes ?? 3
     const retryDelay = config.retryInterval || 1000
@@ -713,6 +1013,8 @@ export function apply(ctx: Context, config: any) {
     }
     return null
   }
+
+  const customRules = buildCustomLinkRules(config.customPlatforms || [])
 
   const axiosConfig: AxiosRequestConfig = {
     timeout: config.timeout,
@@ -747,7 +1049,7 @@ export function apply(ctx: Context, config: any) {
     if (session.subtype === 'file_upload') return
     if (session.elements?.some(elem => elem.type === 'file' || elem.type === 'folder')) return
     if (session.selfId === session.userId) return
-    const matches = extractAllUrlsFromMessage(session, [])
+    const matches = extractAllUrlsFromMessage(session, customRules)
     if (!matches.length) return
     debugLog('INFO', `检测到 ${matches.length} 个音乐链接`)
     if (config.showWaitingTip) { try { await sendWithTimeout(session, texts.waitingTipText) } catch(e) { debugLog('WARN', '等待提示发送失败:', e) } }
@@ -756,7 +1058,7 @@ export function apply(ctx: Context, config: any) {
 
   ctx.command('music <url>', '手动解析音乐').action(async ({ session }, url) => {
     if (!url) { await sendWithTimeout(session, texts.invalidLinkText); return }
-    const matches = linkTypeParser(url, [])
+    const matches = linkTypeParser(url, customRules)
     if (!matches.length) { await sendWithTimeout(session, texts.invalidLinkText); return }
     if (config.showWaitingTip) { try { await sendWithTimeout(session, texts.waitingTipText) } catch {} }
     await flush(session, matches)
@@ -768,7 +1070,7 @@ export function apply(ctx: Context, config: any) {
       const now = Date.now()
       for (const file of files) {
         if ((file.startsWith('music_') || file.startsWith('img_')) &&
-            (file.match(/\.(mp3|m4a|flac|wav|ogg|aac|png|jpg|jpeg|gif|webp)$/i))) {
+            (file.match(/\.(mp3|m4a|flac|wav|ogg|aac|opus|wma|ape|wv|alac|png|jpg|jpeg|gif|webp)$/i))) {
           const filePath = path.join(cacheDir, file)
           const stats = await fs.stat(filePath)
           if (now - stats.mtimeMs > 3600000) { await fs.unlink(filePath).catch(() => {}) }
@@ -792,7 +1094,7 @@ export function apply(ctx: Context, config: any) {
       const files = await fs.readdir(cacheDir)
       for (const file of files) {
         if ((file.startsWith('music_') || file.startsWith('img_')) &&
-            (file.match(/\.(mp3|m4a|flac|wav|ogg|aac|png|jpg|jpeg|gif|webp)$/i))) {
+            (file.match(/\.(mp3|m4a|flac|wav|ogg|aac|opus|wma|ape|wv|alac|png|jpg|jpeg|gif|webp)$/i))) {
           await fs.unlink(path.join(cacheDir, file)).catch(() => {})
         }
       }
