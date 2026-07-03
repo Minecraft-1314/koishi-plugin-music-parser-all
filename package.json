@@ -1,0 +1,76 @@
+{
+  "name": "koishi-plugin-music-parser-all",
+  "description": "Koishi 全平台音乐解析插件，支持网易云音乐/酷我音乐/QQ音乐/汽水音乐等平台",
+  "version": "0.0.1",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc -w",
+    "clean": "rimraf lib"
+  },
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin",
+    "music",
+    "parser",
+    "netease",
+    "kuwo",
+    "qqmusic",
+    "qishui",
+    "音频解析",
+    "音乐解析",
+    "多平台",
+    "网易云音乐",
+    "酷我音乐",
+    "QQ音乐",
+    "汽水音乐"
+  ],
+  "devDependencies": {
+    "@koishijs/client": "^5.30.4",
+    "@koishijs/scripts": "^4.6.2",
+    "rimraf": "^5.0.5",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "axios": "^1.16.1"
+  },
+  "peerDependencies": {
+    "@koishijs/plugin-console": "^5.30.4",
+    "koishi": "^4.18.7",
+    "koishi-plugin-downloads": "^1.0.0",
+    "koishi-plugin-silk": "^1.0.0",
+    "koishi-plugin-ffmpeg": "^1.0.0",
+    "aria2": "^4.1.2"
+  },
+  "peerDependenciesMeta": {
+    "koishi-plugin-downloads": {
+      "optional": true
+    },
+    "koishi-plugin-silk": {
+      "optional": true
+    },
+    "koishi-plugin-ffmpeg": {
+      "optional": true
+    },
+    "aria2": {
+      "optional": true
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Minecraft-1314/koishi-plugin-music-parser-all.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Minecraft-1314/koishi-plugin-music-parser-all/issues"
+  },
+  "homepage": "https://github.com/Minecraft-1314/koishi-plugin-music-parser-all#readme",
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
