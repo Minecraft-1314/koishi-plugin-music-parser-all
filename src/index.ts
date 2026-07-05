@@ -102,13 +102,9 @@ export const Config = Schema.intersect([
     maxMediaSize: Schema.number().min(0).step(1).default(0).description('最大下载文件大小 (MB)，0 为不限制'),
     downloadEngine: Schema.union([
       Schema.const('internal').description('内置下载'),
-      Schema.const('aria2').description('aria2 下载'),
+      Schema.const('aria2').description('aria2 下载（需 koishi-plugin-aria2-plus）'),
       Schema.const('downloads').description('downloads 服务下载'),
     ]).default('internal').description('下载引擎'),
-    aria2Host: Schema.string().default('127.0.0.1').description('aria2 RPC 地址'),
-    aria2Port: Schema.number().default(6800).description('aria2 RPC 端口'),
-    aria2Secret: Schema.string().default('').description('aria2 RPC 密钥'),
-    resumeDownload: Schema.boolean().default(true).description('启用断点续传（仅 aria2 模式）'),
   }).description('性能与限制'),
 
   Schema.object({
@@ -556,18 +552,9 @@ export function apply(ctx: Context, config: any) {
   const mediaDownloadTimeout = config.mediaDownloadTimeout ?? 120000
   const maxMediaSize = config.maxMediaSize ?? 0
   const downloadEngine = config.downloadEngine || 'internal'
-  let aria2: any = null
-  if (downloadEngine === 'aria2') {
-    try {
-      aria2 = ctx.aria2
-      if (aria2) {
-        logger.info('已获取 aria2 服务实例 (koishi-plugin-aria2-plus)')
-      } else {
-        logger.warn('aria2 服务不可用，将回退到内置下载')
-      }
-    } catch (e) {
-      logger.warn('获取 aria2 服务失败，将回退到内置下载')
-    }
+
+  if (downloadEngine === 'aria2' && !ctx.aria2) {
+    logger.warn('选择了 aria2 下载引擎，但未检测到 koishi-plugin-aria2-plus 服务，将回退到内置下载')
   }
 
   const customPlatforms: CustomPlatformConfig[] = (config.customPlatforms || []).map((p: any) => ({
@@ -687,9 +674,9 @@ export function apply(ctx: Context, config: any) {
       } catch (e) {
         debugLog('ERROR', `downloads 下载失败，回退内置下载: ${getErrorMessage(e)}`)
       }
-    } else if (downloadEngine === 'aria2' && aria2 && config.resumeDownload) {
+    } else if (downloadEngine === 'aria2' && ctx.aria2) {
       try {
-        const gid = await aria2.addUri([url], {
+        const gid = await ctx.aria2.addUri([url], {
           dir: cacheDir,
           out: fileName,
           split: 4,
@@ -705,10 +692,10 @@ export function apply(ctx: Context, config: any) {
         const ariaStartTime = Date.now()
         while (!completed) {
           if (Date.now() - ariaStartTime > timeout) {
-            await aria2.remove(gid).catch(() => {})
+            await ctx.aria2.remove(gid).catch(() => {})
             throw new Error('aria2下载超时')
           }
-          const status = await aria2.tellStatus(gid)
+          const status = await ctx.aria2.tellStatus(gid)
           if (status.status === 'complete') {
             completed = true
           } else if (status.status === 'error' || status.status === 'removed') {
