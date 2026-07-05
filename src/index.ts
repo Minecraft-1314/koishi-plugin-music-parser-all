@@ -11,6 +11,7 @@ declare module 'koishi' {
     downloads?: {
       download(url: string, dest: string, options?: Record<string, unknown>): Promise<string>
     }
+    aria2?: any
   }
 }
 
@@ -558,18 +559,14 @@ export function apply(ctx: Context, config: any) {
   let aria2: any = null
   if (downloadEngine === 'aria2') {
     try {
-      const Aria2 = require('aria2')
-      aria2 = new Aria2({
-        host: config.aria2Host || '127.0.0.1',
-        port: config.aria2Port || 6800,
-        secure: false,
-        secret: config.aria2Secret || '',
-        path: '/jsonrpc'
-      })
-      aria2.open()
-      logger.info('aria2 连接成功')
+      aria2 = ctx.aria2
+      if (aria2) {
+        logger.info('已获取 aria2 服务实例 (koishi-plugin-aria2-plus)')
+      } else {
+        logger.warn('aria2 服务不可用，将回退到内置下载')
+      }
     } catch (e) {
-      logger.warn('aria2 连接失败，回退到内置下载')
+      logger.warn('获取 aria2 服务失败，将回退到内置下载')
     }
   }
 
@@ -692,7 +689,7 @@ export function apply(ctx: Context, config: any) {
       }
     } else if (downloadEngine === 'aria2' && aria2 && config.resumeDownload) {
       try {
-        const gid = await aria2.call('aria2.addUri', [url], {
+        const gid = await aria2.addUri([url], {
           dir: cacheDir,
           out: fileName,
           split: 4,
@@ -708,10 +705,10 @@ export function apply(ctx: Context, config: any) {
         const ariaStartTime = Date.now()
         while (!completed) {
           if (Date.now() - ariaStartTime > timeout) {
-            await aria2.call('aria2.remove', gid).catch(() => {})
+            await aria2.remove(gid).catch(() => {})
             throw new Error('aria2下载超时')
           }
-          const status = await aria2.call('aria2.tellStatus', gid)
+          const status = await aria2.tellStatus(gid)
           if (status.status === 'complete') {
             completed = true
           } else if (status.status === 'error' || status.status === 'removed') {
@@ -1083,7 +1080,6 @@ export function apply(ctx: Context, config: any) {
 
   ctx.on('dispose', () => {
     clearInterval(tempCleanupInterval)
-    if (aria2) aria2.close()
     urlCacheLocal.clear()
     dedupCache.clear()
     debugLog('INFO', '音乐解析插件已卸载')

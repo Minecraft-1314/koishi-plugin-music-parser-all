@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-music-parser-all",
   "description": "Koishi 全平台音乐解析插件，支持网易云音乐/酷我音乐/QQ音乐/汽水音乐等平台",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -46,7 +46,7 @@
     "koishi-plugin-downloads": "^1.0.0",
     "koishi-plugin-silk": "^1.0.0",
     "koishi-plugin-ffmpeg": "^1.0.0",
-    "aria2": "^4.1.2"
+    "koishi-plugin-aria2-plus": "^1.0.0"
   },
   "peerDependenciesMeta": {
     "koishi-plugin-downloads": {
@@ -58,7 +58,7 @@
     "koishi-plugin-ffmpeg": {
       "optional": true
     },
-    "aria2": {
+    "koishi-plugin-aria2-plus": {
       "optional": true
     }
   },
