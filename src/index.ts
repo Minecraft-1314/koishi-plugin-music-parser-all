@@ -6,15 +6,6 @@ import { createWriteStream } from 'fs'
 import { pipeline } from 'stream/promises'
 import { randomBytes } from 'crypto'
 
-declare module 'koishi' {
-  interface Context {
-    downloads?: {
-      download(url: string, dest: string, options?: Record<string, unknown>): Promise<string>
-    }
-    aria2?: any
-  }
-}
-
 class SimpleLRUCache<V> {
   private map = new Map<string, { value: V; expireAt: number }>()
   constructor(private max: number, private ttlMs: number) {}
@@ -103,7 +94,7 @@ export const Config = Schema.intersect([
     downloadEngine: Schema.union([
       Schema.const('internal').description('内置下载'),
       Schema.const('aria2').description('aria2 下载（需 koishi-plugin-aria2-plus）'),
-      Schema.const('downloads').description('downloads 服务下载'),
+      Schema.const('downloads').description('downloads 服务下载（需 koishi-plugin-aria2-downloads）'),
     ]).default('internal').description('下载引擎'),
   }).description('性能与限制'),
 
@@ -529,6 +520,9 @@ export function apply(ctx: Context, config: any) {
   debugEnabled = config.debug || false
   debugLog('INFO', '音乐解析插件启动')
 
+  const aria2Service = (ctx as any).get('aria2')
+  const downloadsService = (ctx as any).get('downloads')
+
   const dedupCache = new SimpleLRUCache<number>(1000, config.deduplicationInterval * 1000)
   const cacheTTL = (config.cacheTTL || 600) * 1000
   const urlCacheLocal = new SimpleLRUCache<{ data: ParsedMusic; expire: number }>(500, cacheTTL)
@@ -553,8 +547,11 @@ export function apply(ctx: Context, config: any) {
   const maxMediaSize = config.maxMediaSize ?? 0
   const downloadEngine = config.downloadEngine || 'internal'
 
-  if (downloadEngine === 'aria2' && !ctx.aria2) {
+  if (downloadEngine === 'aria2' && !aria2Service) {
     logger.warn('选择了 aria2 下载引擎，但未检测到 koishi-plugin-aria2-plus 服务，将回退到内置下载')
+  }
+  if (downloadEngine === 'downloads' && !downloadsService) {
+    logger.warn('选择了 downloads 下载引擎，但未检测到 koishi-plugin-downloads 服务，将回退到内置下载')
   }
 
   const customPlatforms: CustomPlatformConfig[] = (config.customPlatforms || []).map((p: any) => ({
@@ -621,6 +618,33 @@ export function apply(ctx: Context, config: any) {
 
   const BACKUP_AGGREGATE_API = config.backupApiUrl || 'https://api.bugpk.com/api/music'
 
+  const axiosConfig: AxiosRequestConfig = {
+    timeout: config.timeout,
+    headers: {
+      'User-Agent': config.userAgent,
+      'Referer': 'https://www.baidu.com/',
+    }
+  }
+  if (proxyConfig.enabled && proxyConfig.host) {
+    axiosConfig.proxy = {
+      protocol: proxyConfig.protocol || 'http',
+      host: proxyConfig.host,
+      port: proxyConfig.port || 7890,
+      auth: proxyConfig.auth?.username ? {
+        username: proxyConfig.auth.username,
+        password: proxyConfig.auth.password || ''
+      } : undefined
+    }
+  }
+  const customHeaders = config.customHeaders || []
+  const http: AxiosInstance = axios.create(axiosConfig)
+  http.interceptors.request.use((config) => {
+    for (const h of customHeaders) {
+      if (h.name && h.value) config.headers[h.name] = h.value
+    }
+    return config
+  })
+
   async function downloadFile(url: string, timeout: number, maxSize: number, filePrefix: string, fileExts: string[]): Promise<string> {
     if (!url) throw new Error('链接为空')
     await fs.mkdir(cacheDir, { recursive: true })
@@ -659,9 +683,9 @@ export function apply(ctx: Context, config: any) {
     const fileName = `${filePrefix}_${Date.now()}_${randomBytes(4).toString('hex')}.${ext}`
     const filePath = path.resolve(cacheDir, fileName)
 
-    if (downloadEngine === 'downloads' && ctx.downloads) {
+    if (downloadEngine === 'downloads' && downloadsService) {
       try {
-        const dest = await ctx.downloads.download(url, path.join(cacheDir, fileName), {
+        const dest = await downloadsService.download(url, path.join(cacheDir, fileName), {
           headers: { 'User-Agent': config.userAgent },
           timeout
         })
@@ -674,9 +698,9 @@ export function apply(ctx: Context, config: any) {
       } catch (e) {
         debugLog('ERROR', `downloads 下载失败，回退内置下载: ${getErrorMessage(e)}`)
       }
-    } else if (downloadEngine === 'aria2' && ctx.aria2) {
+    } else if (downloadEngine === 'aria2' && aria2Service) {
       try {
-        const gid = await ctx.aria2.addUri([url], {
+        const gid = await aria2Service.addUri([url], {
           dir: cacheDir,
           out: fileName,
           split: 4,
@@ -692,10 +716,10 @@ export function apply(ctx: Context, config: any) {
         const ariaStartTime = Date.now()
         while (!completed) {
           if (Date.now() - ariaStartTime > timeout) {
-            await ctx.aria2.remove(gid).catch(() => {})
+            await aria2Service.remove(gid).catch(() => {})
             throw new Error('aria2下载超时')
           }
-          const status = await ctx.aria2.tellStatus(gid)
+          const status = await aria2Service.tellStatus(gid)
           if (status.status === 'complete') {
             completed = true
           } else if (status.status === 'error' || status.status === 'removed') {
@@ -819,7 +843,6 @@ export function apply(ctx: Context, config: any) {
       apiList.push(...backupApis)
     }
 
-    const customHeaders = config.customHeaders || []
     let lastError: Error | null = null
     for (const api of apiList) {
       for (let attempt = 0; attempt <= config.retryTimes; attempt++) {
@@ -827,9 +850,6 @@ export function apply(ctx: Context, config: any) {
           const headers: any = {
             'User-Agent': config.userAgent,
             'Referer': 'https://www.baidu.com/',
-          }
-          for (const h of customHeaders) {
-            if (h.name && h.value) headers[h.name] = h.value
           }
           if (api.apiKey) {
             const authHeaders = buildAuthHeaders(api.apiKey, api.authHeaderType || 'Bearer', api.customHeaderName || 'X-API-Key')
@@ -1000,33 +1020,6 @@ export function apply(ctx: Context, config: any) {
 
   const customRules = buildCustomLinkRules(config.customPlatforms || [])
 
-  const axiosConfig: AxiosRequestConfig = {
-    timeout: config.timeout,
-    headers: {
-      'User-Agent': config.userAgent,
-      'Referer': 'https://www.baidu.com/',
-    }
-  }
-  if (proxyConfig.enabled && proxyConfig.host) {
-    axiosConfig.proxy = {
-      protocol: proxyConfig.protocol || 'http',
-      host: proxyConfig.host,
-      port: proxyConfig.port || 7890,
-      auth: proxyConfig.auth?.username ? {
-        username: proxyConfig.auth.username,
-        password: proxyConfig.auth.password || ''
-      } : undefined
-    }
-  }
-  const customHeaders = config.customHeaders || []
-  const http: AxiosInstance = axios.create(axiosConfig)
-  http.interceptors.request.use((config) => {
-    for (const h of customHeaders) {
-      if (h.name && h.value) config.headers[h.name] = h.value
-    }
-    return config
-  })
-
   ctx.on('message', async (session) => {
     if (!config.enable) return
     if (/^\s*parse\b/i.test(session.content || '')) return
@@ -1088,5 +1081,3 @@ export function apply(ctx: Context, config: any) {
 
   debugLog('INFO', '音乐解析插件初始化完成')
 }
-
-apply.inject = ['aria2', 'downloads']
