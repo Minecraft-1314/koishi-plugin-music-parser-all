@@ -41,17 +41,11 @@ This is a **multi-platform music parsing plugin** developed for the Koishi bot f
 | `showCoverImage` | boolean | true | 发送封面图片 |
 | `showMusicVoice` | boolean | false | 音乐链接以语音形式发送 |
 | `showMusicVoiceFile` | boolean | true | 音乐链接是否以语音形式发送（关闭则只发送链接） |
-| `forceDownloadMusicVoice` | boolean | true | 强制下载音乐语音（推荐开启，避免链接失效） |
-| `forceDownloadImage` | boolean | false | 强制下载封面图片 |
 
-### 性能与限制
+### 性能
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
 | `maxConcurrent` | number | 3 | 解析最大并发数 |
-| `downloadConcurrency` | number | 3 | 下载线程数 |
-| `mediaDownloadTimeout` | number | 120000 | 统一下载超时 (ms) |
-| `maxMediaSize` | number | 0 | 最大下载文件大小 (MB)，0 为不限制 |
-| `downloadEngine` | string | internal | 下载引擎（internal / aria2 / downloads） |
 
 ### 网络与请求
 | 配置项 | 类型 | 默认值 | 说明 |
@@ -70,12 +64,12 @@ This is a **multi-platform music parsing plugin** developed for the Koishi bot f
 | `retryInterval` | number | 1000 | 重试间隔 (ms) |
 | `enableForward` | boolean | false | 合并转发（OneBot/Satori） |
 
-### 缓存与临时文件
+### 缓存与去重
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
+| `enableDeduplication` | boolean | true | 启用重复解析检测与提示 |
 | `deduplicationInterval` | number | 180 | 去重间隔 (s) |
 | `cacheTTL` | number | 600 | 缓存时间 (s) |
-| `cacheDir` | string | ./temp_cache_music | 统一临时目录 |
 
 ### API 与平台
 | 配置项 | 类型 | 默认值 | 说明 |
@@ -105,16 +99,6 @@ This is a **multi-platform music parsing plugin** developed for the Koishi bot f
 | `${level}` | 音质 |
 | `${size}` | 文件大小 |
 
-## 依赖说明 (Dependencies)
-### 音乐语音（可选）
-若启用 `showMusicVoice`，请安装：
-- `koishi-plugin-silk`：silk 编解码
-- `koishi-plugin-ffmpeg`：音频重采样
-### aria2 下载引擎（可选）
-若启用 `downloadEngine: 'aria2'`，请安装可选依赖 `koishi-plugin-aria2-plus` 并配置该插件连接 aria2 服务。插件启动时会自动检测该服务，未安装或不可用时将降级为内置下载，不影响正常使用。
-### downloads 服务（可选）
-若启用 `downloadEngine: 'downloads'`，请安装可选依赖 `koishi-plugin-downloads`，失败时回退到内置下载。
-
 ## 支持的平台 (Supported Platforms)
 
 | 平台名称 | 示例链接 | 解析能力 |
@@ -123,7 +107,7 @@ This is a **multi-platform music parsing plugin** developed for the Koishi bot f
 | 酷我音乐 | `https://www.kuwo.cn/play_detail/...` | 歌曲 |
 | QQ音乐 | `https://y.qq.com/n/ryqq/songDetail/...` | 歌曲 |
 | 汽水音乐 | `https://qishui.douyin.com/s/...` | 歌曲 |
-| 🔧 自定义平台 | 通过 `customPlatforms` 配置添加 | 取决于提供的 API |
+| 自定义平台 | 通过 `customPlatforms` 配置添加 | 取决于提供的 API |
 
 ## 项目贡献者 (Contributors)
 

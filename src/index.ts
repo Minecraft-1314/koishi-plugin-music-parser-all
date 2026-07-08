@@ -1,10 +1,5 @@
 import { Context, Schema, h, Logger } from 'koishi'
 import axios, { AxiosInstance, AxiosRequestConfig } from 'axios'
-import fs from 'fs/promises'
-import path from 'path'
-import { createWriteStream } from 'fs'
-import { pipeline } from 'stream/promises'
-import { randomBytes } from 'crypto'
 
 class SimpleLRUCache<V> {
   private map = new Map<string, { value: V; expireAt: number }>()
@@ -82,21 +77,11 @@ export const Config = Schema.intersect([
     showCoverImage: Schema.boolean().default(true).description('发送封面图片'),
     showMusicVoice: Schema.boolean().default(false).description('音乐链接以语音形式发送'),
     showMusicVoiceFile: Schema.boolean().default(true).description('音乐链接是否以语音形式发送（关闭则只发送链接）'),
-    forceDownloadMusicVoice: Schema.boolean().default(true).description('强制下载音乐语音（推荐开启，避免链接失效）'),
-    forceDownloadImage: Schema.boolean().default(false).description('强制下载封面图片'),
-  }).description('媒体发送与音乐语音'),
+  }).description('媒体发送'),
 
   Schema.object({
     maxConcurrent: Schema.number().min(1).step(1).default(3).description('解析最大并发数'),
-    downloadConcurrency: Schema.number().min(1).step(1).default(3).description('下载线程数'),
-    mediaDownloadTimeout: Schema.number().min(0).step(1).default(120000).description('统一下载超时 (ms)'),
-    maxMediaSize: Schema.number().min(0).step(1).default(0).description('最大下载文件大小 (MB)，0 为不限制'),
-    downloadEngine: Schema.union([
-      Schema.const('internal').description('内置下载'),
-      Schema.const('aria2').description('aria2 下载（需 koishi-plugin-aria2-plus）'),
-      Schema.const('downloads').description('downloads 服务下载（需 koishi-plugin-aria2-downloads）'),
-    ]).default('internal').description('下载引擎'),
-  }).description('性能与限制'),
+  }).description('性能'),
 
   Schema.object({
     timeout: Schema.number().min(0).step(1).default(180000).description('API 请求超时 (ms)'),
@@ -131,10 +116,10 @@ export const Config = Schema.intersect([
   }).description('发送与重试'),
 
   Schema.object({
+    enableDeduplication: Schema.boolean().default(true).description('启用重复解析检测与提示'),
     deduplicationInterval: Schema.number().min(0).step(1).default(180).description('去重间隔 (s)'),
     cacheTTL: Schema.number().min(0).step(1).default(600).description('缓存时间 (s)'),
-    cacheDir: Schema.string().default('./temp_cache_music').description('统一临时目录'),
-  }).description('缓存与临时文件'),
+  }).description('缓存与去重'),
 
   Schema.object({
     primaryApiUrl: Schema.string().default('https://api.bugpk.com/api/163_music').hidden(),
@@ -520,9 +505,7 @@ export function apply(ctx: Context, config: any) {
   debugEnabled = config.debug || false
   debugLog('INFO', '音乐解析插件启动')
 
-  const aria2Service = (ctx as any).get('aria2')
-  const downloadsService = (ctx as any).get('downloads')
-
+  const dedupEnabled = config.enableDeduplication !== false
   const dedupCache = new SimpleLRUCache<number>(1000, config.deduplicationInterval * 1000)
   const cacheTTL = (config.cacheTTL || 600) * 1000
   const urlCacheLocal = new SimpleLRUCache<{ data: ParsedMusic; expire: number }>(500, cacheTTL)
@@ -541,18 +524,6 @@ export function apply(ctx: Context, config: any) {
   }
 
   const proxyConfig = config.proxy || {}
-  const cacheDir = config.cacheDir || './temp_cache_music'
-  const downloadLimiter = new ConcurrencyLimiter(config.downloadConcurrency || 3)
-  const mediaDownloadTimeout = config.mediaDownloadTimeout ?? 120000
-  const maxMediaSize = config.maxMediaSize ?? 0
-  const downloadEngine = config.downloadEngine || 'internal'
-
-  if (downloadEngine === 'aria2' && !aria2Service) {
-    logger.warn('选择了 aria2 下载引擎，但未检测到 koishi-plugin-aria2-plus 服务，将回退到内置下载')
-  }
-  if (downloadEngine === 'downloads' && !downloadsService) {
-    logger.warn('选择了 downloads 下载引擎，但未检测到 koishi-plugin-downloads 服务，将回退到内置下载')
-  }
 
   const customPlatforms: CustomPlatformConfig[] = (config.customPlatforms || []).map((p: any) => ({
     name: p.name,
@@ -645,187 +616,12 @@ export function apply(ctx: Context, config: any) {
     return config
   })
 
-  async function downloadFile(url: string, timeout: number, maxSize: number, filePrefix: string, fileExts: string[]): Promise<string> {
-    if (!url) throw new Error('链接为空')
-    await fs.mkdir(cacheDir, { recursive: true })
-
-    let ext = fileExts.find(e => new RegExp('\\.' + e + '(\\?|$)', 'i').test(url))
-    if (!ext) {
-      try {
-        const urlObj = new URL(url)
-        const mimeType = urlObj.searchParams.get('mime_type')
-        if (mimeType) {
-          const mimeMap: Record<string, string> = {
-            'audio_mp4': 'm4a',
-            'audio/mp4': 'm4a',
-            'audio_mpeg': 'mp3',
-            'audio/mpeg': 'mp3',
-            'audio_mp3': 'mp3',
-            'audio/mp3': 'mp3',
-            'audio_flac': 'flac',
-            'audio/flac': 'flac',
-            'audio_wav': 'wav',
-            'audio/wav': 'wav',
-            'audio_ogg': 'ogg',
-            'audio/ogg': 'ogg',
-            'audio_aac': 'aac',
-            'audio/aac': 'aac',
-          }
-          const mappedExt = mimeMap[mimeType]
-          if (mappedExt && fileExts.includes(mappedExt)) {
-            ext = mappedExt
-          }
-        }
-      } catch {}
-    }
-    ext = ext || fileExts[0]
-
-    const fileName = `${filePrefix}_${Date.now()}_${randomBytes(4).toString('hex')}.${ext}`
-    const filePath = path.resolve(cacheDir, fileName)
-
-    if (downloadEngine === 'downloads' && downloadsService) {
-      try {
-        const dest = await downloadsService.download(url, path.join(cacheDir, fileName), {
-          headers: { 'User-Agent': config.userAgent },
-          timeout
-        })
-        const stat = await fs.stat(dest)
-        if (maxSize > 0 && stat.size > maxSize * 1024 * 1024) {
-          await fs.unlink(dest).catch(() => {})
-          throw new Error(`文件过大(${Math.round(stat.size/1024/1024)}MB)，超过限制(${maxSize}MB)`)
-        }
-        return dest
-      } catch (e) {
-        debugLog('ERROR', `downloads 下载失败，回退内置下载: ${getErrorMessage(e)}`)
-      }
-    } else if (downloadEngine === 'aria2' && aria2Service) {
-      try {
-        const gid = await aria2Service.addUri([url], {
-          dir: cacheDir,
-          out: fileName,
-          split: 4,
-          continue: true,
-          maxConnectionPerServer: 5,
-          timeout: timeout / 1000,
-          maxFileNotFound: 5,
-          maxTries: 5,
-          retryWait: 2,
-          header: [`User-Agent: ${config.userAgent}`, `Referer: https://www.baidu.com/`]
-        })
-        let completed = false
-        const ariaStartTime = Date.now()
-        while (!completed) {
-          if (Date.now() - ariaStartTime > timeout) {
-            await aria2Service.remove(gid).catch(() => {})
-            throw new Error('aria2下载超时')
-          }
-          const status = await aria2Service.tellStatus(gid)
-          if (status.status === 'complete') {
-            completed = true
-          } else if (status.status === 'error' || status.status === 'removed') {
-            throw new Error('aria2下载失败')
-          } else {
-            await delay(1000)
-          }
-        }
-        const stat = await fs.stat(filePath)
-        if (maxSize > 0 && stat.size > maxSize * 1024 * 1024) {
-          await fs.unlink(filePath).catch(() => {})
-          throw new Error(`文件过大(${Math.round(stat.size/1024/1024)}MB)，超过限制(${maxSize}MB)`)
-        }
-        return filePath
-      } catch (e) {
-        debugLog('ERROR', `aria2下载失败，回退内置下载: ${getErrorMessage(e)}`)
-      }
-    }
-
-    const writer = createWriteStream(filePath)
-    let response
-    try {
-      response = await http({
-        method: 'GET',
-        url,
-        responseType: 'stream',
-        timeout,
-        headers: { 'User-Agent': config.userAgent, 'Referer': 'https://www.baidu.com/' },
-        maxRedirects: 5,
-        validateStatus: (status: number) => status >= 200 && status < 300,
-      })
-    } catch (e) {
-      writer.destroy()
-      await fs.unlink(filePath).catch(() => {})
-      throw new Error(`下载失败: ${getErrorMessage(e)}`)
-    }
-    const maxSizeBytes = maxSize * 1024 * 1024
-    const contentLength = Number(response.headers['content-length'] || 0)
-    if (maxSizeBytes > 0 && contentLength > maxSizeBytes) {
-      writer.destroy()
-      await fs.unlink(filePath).catch(() => {})
-      throw new Error(`文件过大(${Math.round(contentLength/1024/1024)}MB)，超过限制(${maxSize}MB)`)
-    }
-    try {
-      await pipeline(response.data, writer)
-      return filePath
-    } catch (e) {
-      await fs.unlink(filePath).catch(() => {})
-      throw new Error(`写入文件失败: ${getErrorMessage(e)}`)
-    }
-  }
-
-  async function sendMedia(session: any, url: string, type: 'image' | 'audio', forceDownload: boolean, showFile: boolean) {
-    if (!url) return
-    await downloadLimiter.acquire()
-    try {
-      const sendLink = async () => { await sendWithTimeout(session, `${type === 'audio' ? '音乐' : '封面'}链接：${url}`).catch(() => {}) }
-      const extMap: Record<string, string[]> = {
-        image: ['png', 'jpg', 'jpeg', 'gif', 'webp'],
-        audio: ['mp3', 'm4a', 'flac', 'wav', 'ogg', 'aac', 'opus', 'wma', 'ape', 'wv', 'alac']
-      }
-      const prefixMap = { image: 'img', audio: 'music' }
-      const sendFunc = type === 'audio' ? h.audio : h.image
-
-      if (forceDownload) {
-        try {
-          const localPath = await downloadFile(url, mediaDownloadTimeout, maxMediaSize, prefixMap[type], extMap[type])
-          try {
-            await sendWithTimeout(session, sendFunc(`file://${localPath}`))
-          } finally {
-            await fs.unlink(localPath).catch(() => {})
-          }
-          return
-        } catch (e) {
-          debugLog('ERROR', `强制下载${type}失败，尝试URL发送:`, getErrorMessage(e))
-          try {
-            await sendWithTimeout(session, sendFunc(url))
-          } catch { await sendLink() }
-        }
-        return
-      }
-      if (!showFile) {
-        await sendLink()
-        return
-      }
-      try {
-        await sendWithTimeout(session, sendFunc(url))
-      } catch {
-        try {
-          const localPath = await downloadFile(url, mediaDownloadTimeout, maxMediaSize, prefixMap[type], extMap[type])
-          try {
-            await sendWithTimeout(session, sendFunc(`file://${localPath}`))
-          } finally {
-            await fs.unlink(localPath).catch(() => {})
-          }
-        } catch { await sendLink() }
-      }
-    } finally {
-      downloadLimiter.release()
-    }
-  }
-
   async function fetchApi(url: string, type: string, matchId: string, fieldMapping?: Record<string, string>, platformConf?: any): Promise<ParsedMusic> {
     const cacheKey = url
-    const cached = urlCacheLocal.get(cacheKey)
-    if (cached && cached.expire > Date.now()) return cached.data
+    if (dedupEnabled) {
+      const cached = urlCacheLocal.get(cacheKey)
+      if (cached && cached.expire > Date.now()) return cached.data
+    }
 
     const { apiUrl: dedicatedUrl, dedicatedFirst, apiKey, authHeaderType, customHeaderName, customProxy } = platformConf || getPlatformConfig(type)
     const primaryApi = dedicatedUrl
@@ -882,7 +678,9 @@ export function apply(ctx: Context, config: any) {
           const rawData = res.data
           if (rawData && (rawData.code === 200 || rawData.code === 0 || (apiUrl === BACKUP_AGGREGATE_API && rawData.url))) {
             const parsed = parseApiResponse(rawData, type, api.fieldMapping)
-            urlCacheLocal.set(cacheKey, { data: parsed, expire: Date.now() + cacheTTL })
+            if (dedupEnabled) {
+              urlCacheLocal.set(cacheKey, { data: parsed, expire: Date.now() + cacheTTL })
+            }
             return parsed
           }
           throw new Error(rawData?.msg || `API返回错误码: ${rawData?.code}`)
@@ -921,7 +719,7 @@ export function apply(ctx: Context, config: any) {
           debugLog('INFO', `平台 ${match.type} 已禁用，跳过链接: ${match.url}`)
           return
         }
-        if (config.deduplicationInterval > 0) {
+        if (dedupEnabled && config.deduplicationInterval > 0) {
           const lastTime = dedupCache.get(match.url)
           if (lastTime && (Date.now() - lastTime < config.deduplicationInterval * 1000)) {
             debugLog('INFO', `跳过重复链接: ${match.url}`)
@@ -932,7 +730,7 @@ export function apply(ctx: Context, config: any) {
         const platformConf = getPlatformConfig(match.type)
         const result = await processSingleUrl(match.url, match.type, match.id, platformConf.fieldMapping, platformConf)
         if (result.success) {
-          if (config.deduplicationInterval > 0) {
+          if (dedupEnabled && config.deduplicationInterval > 0) {
             const fp = contentFingerprint(result.data.parsed)
             const lastDedup = contentDedupCache.get(fp)
             if (lastDedup && (Date.now() - lastDedup < config.deduplicationInterval * 1000)) {
@@ -984,11 +782,23 @@ export function apply(ctx: Context, config: any) {
         const text = item.text
         if (text && config.showMusicText) { await sendWithTimeout(session, text); await delay(300) }
         if (p.cover && config.showCoverImage) {
-          await sendMedia(session, p.cover, 'image', config.forceDownloadImage, true).catch(() => {})
+          try {
+            await sendWithTimeout(session, h.image(p.cover))
+          } catch {
+            await sendWithTimeout(session, `封面链接：${p.cover}`).catch(() => {})
+          }
           await delay(300)
         }
         if (p.musicUrl && config.showMusicVoice) {
-          await sendMedia(session, p.musicUrl, 'audio', config.forceDownloadMusicVoice, config.showMusicVoiceFile).catch(() => {})
+          if (config.showMusicVoiceFile) {
+            try {
+              await sendWithTimeout(session, h.audio(p.musicUrl))
+            } catch {
+              await sendWithTimeout(session, `音乐链接：${p.musicUrl}`).catch(() => {})
+            }
+          } else {
+            await sendWithTimeout(session, `音乐链接：${p.musicUrl}`).catch(() => {})
+          }
           await delay(500)
         }
       }
@@ -1041,42 +851,10 @@ export function apply(ctx: Context, config: any) {
     await flush(session, matches)
   })
 
-  const tempCleanupInterval = setInterval(async () => {
-    try {
-      const files = await fs.readdir(cacheDir)
-      const now = Date.now()
-      for (const file of files) {
-        if ((file.startsWith('music_') || file.startsWith('img_')) &&
-            (file.match(/\.(mp3|m4a|flac|wav|ogg|aac|opus|wma|ape|wv|alac|png|jpg|jpeg|gif|webp)$/i))) {
-          const filePath = path.join(cacheDir, file)
-          const stats = await fs.stat(filePath)
-          if (now - stats.mtimeMs > 3600000) { await fs.unlink(filePath).catch(() => {}) }
-        }
-      }
-    } catch (e) {
-      if ((e as any)?.code !== 'ENOENT') debugLog('WARN', '清理临时文件失败:', e)
-    }
-  }, 3600000)
-
   ctx.on('dispose', () => {
-    clearInterval(tempCleanupInterval)
     urlCacheLocal.clear()
     dedupCache.clear()
     debugLog('INFO', '音乐解析插件已卸载')
-  })
-
-  process.on('beforeExit', async () => {
-    try {
-      const files = await fs.readdir(cacheDir)
-      for (const file of files) {
-        if ((file.startsWith('music_') || file.startsWith('img_')) &&
-            (file.match(/\.(mp3|m4a|flac|wav|ogg|aac|opus|wma|ape|wv|alac|png|jpg|jpeg|gif|webp)$/i))) {
-          await fs.unlink(path.join(cacheDir, file)).catch(() => {})
-        }
-      }
-    } catch (e) {
-      if ((e as any)?.code !== 'ENOENT') debugLog('WARN', '退出清理临时文件失败:', e)
-    }
   })
 
   debugLog('INFO', '音乐解析插件初始化完成')
