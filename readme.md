@@ -16,7 +16,7 @@ This is a **multi-platform music parsing plugin** developed for the Koishi bot f
 
 | 指令 (Command) | 说明 (Description) | 示例 (Example) |
 |----------------|--------------------|----------------|
-| `music <url>` | 手动解析指定的音乐链接 (Manually parse the given music URL) | `music https://music.163.com/song?id=123456` |
+| `music-parse <url>` | 手动解析指定的音乐链接 (Manually parse the given music URL) | `music-parse https://music.163.com/song?id=123456` |
 
 ## 配置项说明 (Configuration)
 
