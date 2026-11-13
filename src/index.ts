@@ -1,11 +1,11 @@
 import { Context, Schema, h, Logger } from 'koishi'
 import axios, { AxiosRequestConfig } from 'axios'
 import { SimpleLRUCache, ConcurrencyLimiter } from './cache'
-import { DebugLogger, buildForwardNode, delay, generateFormattedText, getErrorMessage } from './utils'
-import { buildCustomLinkRules, extractAllUrlsFromMessage, linkTypeParser } from './parser'
+import { DebugLogger, buildForwardNode, delay, formatDuration, generateFormattedText, getErrorMessage } from './utils'
+import { PLATFORM_LABELS, SUPPORTED_PLATFORMS, buildCustomLinkRules, extractAllUrlsFromMessage, linkTypeParser } from './link-rules'
 import { normalizeCustomPlatforms, PlatformResolver } from './platform'
-import { ApiClient } from './api'
-import type { LinkMatch, ParsedItem, ParsedMusic } from './types'
+import { ApiClient } from './service/api'
+import type { LinkMatch, ParsedItem, ParsedMusic, ParsedPlaylist } from './types'
 
 export const name = 'music-parser-all'
 
@@ -28,6 +28,9 @@ export interface Config {
   showCoverImage: boolean
   showMusicVoice: boolean
   showMusicVoiceFile: boolean
+  expandPlaylistTracks: boolean
+  maxPlaylistTracks: number
+  trackRequestInterval: number
   maxConcurrent: number
   timeout: number
   videoSendTimeout: number
@@ -41,8 +44,10 @@ export interface Config {
   enableDeduplication: boolean
   deduplicationInterval: number
   cacheTTL: number
-  primaryApiUrl: string
-  backupApiUrl: string
+  apiKey: string
+  authMode: string
+  authHeaderType: string
+  customHeaderName: string
   platformDedicatedFirst: Record<string, boolean>
   customApis: any[]
   customPlatforms: any[]
@@ -54,6 +59,18 @@ export interface Config {
   parseErrorItemFormat: string
 }
 
+const DEFAULT_FIELD_MAPPING = JSON.stringify({
+  name: 'data.name',
+  artist: 'data.singer',
+  album: 'data.album',
+  cover: 'data.pic',
+  musicUrl: 'data.url',
+  level: 'data.label',
+  size: 'data.size_label',
+}, null, 2)
+
+const MAX_FORWARD_NODES = 100
+
 export const Config = Schema.intersect([
   Schema.object({
     enable: Schema.boolean().default(true).description('是否启用音乐解析插件'),
@@ -62,8 +79,6 @@ export const Config = Schema.intersect([
     debug: Schema.boolean().default(false).description('开启调试日志'),
     platformEnabled: Schema.object({
       netease: Schema.boolean().default(true).description('网易云音乐'),
-      kuwo: Schema.boolean().default(true).description('酷我音乐'),
-      qqmusic: Schema.boolean().default(true).description('QQ音乐'),
       qishui: Schema.boolean().default(true).description('汽水音乐'),
     }).description('各平台解析开关'),
   }).description('基本设置'),
@@ -80,6 +95,12 @@ export const Config = Schema.intersect([
     showMusicVoice: Schema.boolean().default(false).description('音乐链接以语音形式发送'),
     showMusicVoiceFile: Schema.boolean().default(true).description('音乐链接是否以语音形式发送（关闭则只发送链接）'),
   }).description('媒体发送'),
+
+  Schema.object({
+    expandPlaylistTracks: Schema.boolean().default(false).description('解析歌单时逐首获取直链（注意接口限流）'),
+    maxPlaylistTracks: Schema.number().min(1).max(50).step(1).default(10).description('逐首获取的最大曲目数'),
+    trackRequestInterval: Schema.number().min(0).step(100).default(5000).description('逐首获取的请求间隔 (ms)'),
+  }).description('歌单展开'),
 
   Schema.object({
     maxConcurrent: Schema.number().min(1).step(1).default(3).description('解析最大并发数'),
@@ -124,29 +145,38 @@ export const Config = Schema.intersect([
   }).description('缓存与去重'),
 
   Schema.object({
-    primaryApiUrl: Schema.string().default('https://api.bugpk.com/api/163_music').hidden(),
-    backupApiUrl: Schema.string().default('https://api.bugpk.com/api/music').hidden(),
+    apiKey: Schema.string().default('').role('secret').description('api-new.ifphp.com API Key'),
+    authMode: Schema.union([
+      Schema.const('header').description('请求头'),
+      Schema.const('query').description('URL 参数'),
+    ]).default('header').description('认证方式'),
+    authHeaderType: Schema.union([
+      Schema.const('Bearer').description('Bearer'),
+      Schema.const('X-API-Key').description('X-API-Key'),
+      Schema.const('Custom').description('自定义'),
+    ]).default('X-API-Key').description('认证头类型'),
+    customHeaderName: Schema.string().default('X-API-Key').description('自定义头名称'),
     platformDedicatedFirst: Schema.object({
-      netease: Schema.boolean().default(false).description('网易云音乐'),
-      kuwo: Schema.boolean().default(false).description('酷我音乐'),
-      qqmusic: Schema.boolean().default(false).description('QQ音乐'),
-      qishui: Schema.boolean().default(false).description('汽水音乐'),
+      netease: Schema.boolean().default(true).description('网易云音乐'),
+      qishui: Schema.boolean().default(true).description('汽水音乐'),
     }).description('优先使用专属 API'),
     customApis: Schema.array(
       Schema.object({
         platform: Schema.union([
           Schema.const('netease').description('网易云音乐'),
-          Schema.const('kuwo').description('酷我音乐'),
-          Schema.const('qqmusic').description('QQ音乐'),
           Schema.const('qishui').description('汽水音乐'),
         ]).description('平台'),
         apiUrl: Schema.string().description('API 地址'),
         apiKey: Schema.string().description('API Key').default(''),
+        authMode: Schema.union([
+          Schema.const('header').description('请求头'),
+          Schema.const('query').description('URL 参数'),
+        ]).default('header').description('认证方式'),
         authHeaderType: Schema.union([
           Schema.const('Bearer').description('Bearer'),
           Schema.const('X-API-Key').description('X-API-Key'),
           Schema.const('Custom').description('自定义'),
-        ]).default('Bearer').description('认证头类型'),
+        ]).default('X-API-Key').description('认证头类型'),
         customHeaderName: Schema.string().default('X-API-Key').description('自定义头名称'),
         fieldMapping: Schema.string().role('textarea').default('{}').description('字段映射 JSON'),
       })
@@ -158,11 +188,15 @@ export const Config = Schema.intersect([
         keywords: Schema.string().required().description('关键词（逗号分隔）'),
         apiUrl: Schema.string().required().description('解析 API'),
         apiKey: Schema.string().default('').description('API Key'),
+        authMode: Schema.union([
+          Schema.const('header').description('请求头'),
+          Schema.const('query').description('URL 参数'),
+        ]).default('header').description('认证方式'),
         authHeaderType: Schema.union([
           Schema.const('Bearer').description('Bearer'),
           Schema.const('X-API-Key').description('X-API-Key'),
           Schema.const('Custom').description('自定义'),
-        ]).default('Bearer').description('认证头类型'),
+        ]).default('X-API-Key').description('认证头类型'),
         customHeaderName: Schema.string().default('X-API-Key').description('自定义头名称'),
         fieldMapping: Schema.string().role('textarea').default('{}').description('字段映射 JSON'),
         proxy: Schema.object({
@@ -180,17 +214,7 @@ export const Config = Schema.intersect([
         }).description('独立代理（覆盖全局代理）'),
       })
     ).default([]).description('自定义新平台'),
-    globalFieldMapping: Schema.string().role('textarea').default(
-      '{\n' +
-      '  "name": "data.name",\n' +
-      '  "artist": "data.ar_name",\n' +
-      '  "album": "data.al_name",\n' +
-      '  "cover": "data.pic",\n' +
-      '  "musicUrl": "data.url",\n' +
-      '  "level": "data.level",\n' +
-      '  "size": "data.size"\n' +
-      '}'
-    ).description('全局字段映射 JSON'),
+    globalFieldMapping: Schema.string().role('textarea').default(DEFAULT_FIELD_MAPPING).description('全局字段映射 JSON'),
   }).description('API 与平台'),
 
   Schema.object({
@@ -207,12 +231,17 @@ export function apply(ctx: Context, config: Config) {
   const debug = new DebugLogger(logger, config.debug || false)
   debug.log('INFO', '音乐解析插件启动')
 
+  if (!config.apiKey && !(config.customApis || []).some((item: any) => item?.apiKey)) {
+    logger.warn('未配置 api-new.ifphp.com API Key，所有解析请求可能失败。请在插件配置中填写 apiKey。')
+  }
+
   const dedupEnabled = config.enableDeduplication !== false
   const dedupInterval = (config.deduplicationInterval || 180) * 1000
   const cacheTTL = (config.cacheTTL || 600) * 1000
   const dedupCache = new SimpleLRUCache<number>(1000, dedupInterval)
   const contentDedupCache = new SimpleLRUCache<number>(1000, dedupInterval)
   const urlCacheLocal = new SimpleLRUCache<ParsedMusic>(500, cacheTTL)
+  const playlistCacheLocal = new SimpleLRUCache<ParsedPlaylist>(100, cacheTTL)
 
   const texts = {
     waitingTipText: config.waitingTipText || '正在解析音乐，请稍候...',
@@ -253,7 +282,7 @@ export function apply(ctx: Context, config: Config) {
     return cfg
   })
 
-  const apiClient = new ApiClient({ http, config, dedupEnabled, cacheTTL, urlCache: urlCacheLocal, debug })
+  const apiClient = new ApiClient({ http, config, dedupEnabled, cacheTTL, urlCache: urlCacheLocal, playlistCache: playlistCacheLocal, debug })
 
   function contentFingerprint(p: ParsedMusic): string {
     return [p.type, p.name, p.artist, p.album, p.musicUrl].map(v => String(v ?? '')).join('::')
@@ -274,8 +303,7 @@ export function apply(ctx: Context, config: Config) {
         }
         return await sendPromise
       } catch (err) {
-        const errMsg = getErrorMessage(err)
-        debug.log('ERROR', `发送失败尝试 ${attempt + 1}: ${errMsg}`)
+        debug.log('ERROR', `发送失败尝试 ${attempt + 1}: ${getErrorMessage(err)}`)
         if (attempt < maxRetries) {
           await delay(retryDelay)
         } else if (!config.ignoreSendError) {
@@ -288,56 +316,27 @@ export function apply(ctx: Context, config: Config) {
     return null
   }
 
-  async function flush(session: any, matches: LinkMatch[]) {
-    debug.log('INFO', `开始解析 ${matches.length} 个链接`)
-    const items: ParsedItem[] = []
-    const errors: string[] = []
-    const limiter = new ConcurrencyLimiter(config.maxConcurrent || 3)
+  async function sendCover(session: any, cover: string) {
+    try {
+      await sendWithTimeout(session, h.image(cover))
+    } catch {
+      await sendWithTimeout(session, `封面链接：${cover}`).catch(() => {})
+    }
+  }
 
-    const promises = matches.map(async match => {
-      await limiter.acquire()
+  async function sendMusicVoice(session: any, musicUrl: string) {
+    if (config.showMusicVoiceFile) {
       try {
-        const platformEnabled = config.platformEnabled?.[match.type] ?? true
-        if (!platformEnabled && !match.type.startsWith('custom_')) {
-          debug.log('INFO', `平台 ${match.type} 已禁用，跳过链接: ${match.url}`)
-          return
-        }
-        if (dedupEnabled && config.deduplicationInterval > 0) {
-          const lastTime = dedupCache.get(match.url)
-          if (lastTime && (Date.now() - lastTime < config.deduplicationInterval * 1000)) {
-            debug.log('INFO', `跳过重复链接: ${match.url}`)
-            return
-          }
-        }
-        debug.log('INFO', `解析链接: ${match.url} (${match.type})`)
-        const platformConf = resolver.resolve(match.type)
-        try {
-          const parsed = await apiClient.fetch(match.url, match.type, match.id, platformConf)
-          if (dedupEnabled && config.deduplicationInterval > 0) {
-            const fp = contentFingerprint(parsed)
-            const lastDedup = contentDedupCache.get(fp)
-            if (lastDedup && (Date.now() - lastDedup < config.deduplicationInterval * 1000)) {
-              debug.log('INFO', `跳过重复内容: ${match.url}`)
-              return
-            }
-            contentDedupCache.set(fp, Date.now())
-            dedupCache.set(match.url, Date.now())
-          }
-          items.push({ text: generateFormattedText(parsed, config.unifiedMessageFormat), parsed })
-        } catch (error) {
-          const msg = getErrorMessage(error)
-          const displayUrl = match.url.length > 50 ? match.url.slice(0, 50) + '...' : match.url
-          errors.push(texts.parseErrorItemFormat.replace(/\$\{url\}/g, displayUrl).replace(/\$\{msg\}/g, msg))
-        }
-      } finally {
-        limiter.release()
+        await sendWithTimeout(session, h.audio(musicUrl))
+        return
+      } catch {
+        debug.log('WARN', `语音发送失败，降级发送链接: ${musicUrl}`)
       }
-    })
-    await Promise.all(promises)
+    }
+    await sendWithTimeout(session, `音乐链接：${musicUrl}`).catch(() => {})
+  }
 
-    if (errors.length) await sendWithTimeout(session, `${texts.parseErrorPrefix}\n${errors.join('\n')}`)
-    if (!items.length) return
-
+  async function emitItems(session: any, items: ParsedItem[]) {
     const enableForward = config.enableForward && (session.platform === 'onebot' || session.platform === 'satori')
     const botName = config.botName || '音乐解析机器人'
 
@@ -349,44 +348,182 @@ export function apply(ctx: Context, config: Config) {
         if (p.cover && config.showCoverImage) forwardMessages.push(buildForwardNode(session, h.image(p.cover), botName))
         if (p.musicUrl && config.showMusicVoice) forwardMessages.push(buildForwardNode(session, h.audio(p.musicUrl), botName))
       }
-      if (forwardMessages.length) {
+      if (!forwardMessages.length) return
+      for (let i = 0; i < forwardMessages.length; i += MAX_FORWARD_NODES) {
+        const chunk = forwardMessages.slice(i, i + MAX_FORWARD_NODES)
         try {
-          await sendWithTimeout(session, h('message', { forward: true }, forwardMessages.slice(0, 100)), config.retryTimes)
+          await sendWithTimeout(session, h('message', { forward: true }, chunk), config.retryTimes)
         } catch (err) {
-          debug.log('ERROR', '合并转发失败，降级逐条发送:', err)
-          for (const node of forwardMessages) {
+          debug.log('ERROR', `合并转发失败，降级逐条发送: ${getErrorMessage(err)}`)
+          for (const node of chunk) {
             await sendWithTimeout(session, node.data.content).catch(() => {})
             await delay(300)
           }
         }
       }
-    } else {
-      for (const item of items) {
-        const p = item.parsed
-        if (item.text && config.showMusicText) {
-          await sendWithTimeout(session, item.text)
-          await delay(300)
+      return
+    }
+
+    for (const item of items) {
+      const p = item.parsed
+      if (item.text && config.showMusicText) {
+        await sendWithTimeout(session, item.text)
+        await delay(300)
+      }
+      if (p.cover && config.showCoverImage) {
+        await sendCover(session, p.cover)
+        await delay(300)
+      }
+      if (p.musicUrl && config.showMusicVoice) {
+        await sendMusicVoice(session, p.musicUrl)
+        await delay(500)
+      }
+    }
+  }
+
+  function buildPlaylistText(playlist: ParsedPlaylist): string {
+    const info = playlist.playlist
+    const lines: string[] = []
+    lines.push(`歌单：${info.name || '未知歌单'}`)
+    if (info.creator) lines.push(`创建者：${info.creator}`)
+    if (info.trackCount) lines.push(`曲目数：${info.trackCount}`)
+    if (info.description) lines.push(`简介：${info.description.slice(0, 200)}`)
+    const tracks = info.tracks.slice(0, 100)
+    if (tracks.length) {
+      lines.push('曲目列表：')
+      tracks.forEach((track, index) => {
+        const duration = track.duration ? ` (${formatDuration(track.duration)})` : ''
+        lines.push(`${index + 1}. ${track.name} - ${track.artist || '未知歌手'}${duration}`)
+      })
+      if (info.tracks.length > tracks.length) lines.push(`……共 ${info.tracks.length} 首，仅显示前 ${tracks.length} 首`)
+    }
+    return lines.join('\n')
+  }
+
+  async function handlePlaylist(session: any, match: LinkMatch) {
+    const platformConf = resolver.resolve(match.type)
+    let playlist: ParsedPlaylist | null = null
+    try {
+      playlist = await apiClient.fetchPlaylist(match.url, match.type, match.id, platformConf)
+    } catch (error) {
+      debug.log('ERROR', `歌单解析失败: ${getErrorMessage(error)}`)
+    }
+    if (!playlist) {
+      const displayUrl = match.url.length > 50 ? match.url.slice(0, 50) + '...' : match.url
+      await sendWithTimeout(session, `${texts.parseErrorPrefix}\n${texts.parseErrorItemFormat.replace(/\$\{url\}/g, displayUrl).replace(/\$\{msg\}/g, '歌单解析失败')}`)
+      return
+    }
+
+    const items: ParsedItem[] = []
+    items.push({
+      text: buildPlaylistText(playlist),
+      parsed: {
+        type: match.type,
+        name: playlist.playlist.name || '未知歌单',
+        artist: playlist.playlist.creator,
+        album: '',
+        cover: playlist.playlist.cover,
+        musicUrl: '',
+      },
+    })
+
+    if (config.expandPlaylistTracks && playlist.playlist.tracks.length) {
+      const limit = Math.min(Math.max(1, config.maxPlaylistTracks || 10), playlist.playlist.tracks.length)
+      const ids = playlist.playlist.tracks.slice(0, limit).map(t => t.id)
+      const tracks = await apiClient.fetchTracksBatch(match.type, platformConf, ids)
+      tracks.forEach((parsed, index) => {
+        items.push({ text: generateFormattedText(parsed, config.unifiedMessageFormat, index, tracks.length), parsed })
+      })
+    }
+
+    await emitItems(session, items)
+  }
+
+  async function flush(session: any, matches: LinkMatch[]) {
+    debug.log('INFO', `开始解析 ${matches.length} 个链接`)
+    const pending: Array<{ order: number; fn: () => Promise<void> }> = []
+    const limiter = new ConcurrencyLimiter(config.maxConcurrent || 3)
+    const processedUrls = new Set<string>()
+    const processedContents = new Set<string>()
+    let seq = 0
+
+    const tasks = matches.map(async match => {
+      await limiter.acquire()
+      try {
+        const isCustom = match.type.startsWith('custom_')
+        if (!isCustom && !SUPPORTED_PLATFORMS.includes(match.type as any)) {
+          debug.log('INFO', `平台 ${match.type} 不受支持，跳过链接: ${match.url}`)
+          return
         }
-        if (p.cover && config.showCoverImage) {
-          try {
-            await sendWithTimeout(session, h.image(p.cover))
-          } catch {
-            await sendWithTimeout(session, `封面链接：${p.cover}`).catch(() => {})
+        if (!isCustom) {
+          const platformEnabled = config.platformEnabled?.[match.type] ?? true
+          if (!platformEnabled) {
+            debug.log('INFO', `平台 ${match.type} 已禁用，跳过链接: ${match.url}`)
+            return
           }
-          await delay(300)
         }
-        if (p.musicUrl && config.showMusicVoice) {
-          if (config.showMusicVoiceFile) {
+        if (dedupEnabled && config.deduplicationInterval > 0) {
+          const lastTime = dedupCache.get(match.url)
+          if (lastTime && (Date.now() - lastTime < config.deduplicationInterval * 1000)) {
+            debug.log('INFO', `跳过重复链接: ${match.url}`)
+            return
+          }
+        }
+        if (processedUrls.has(match.url)) {
+          debug.log('INFO', `跳过本批重复链接: ${match.url}`)
+          return
+        }
+        processedUrls.add(match.url)
+
+        const order = ++seq
+        if (match.kind === 'playlist') {
+          pending.push({ order, fn: () => handlePlaylist(session, match) })
+          return
+        }
+
+        pending.push({
+          order,
+          fn: async () => {
+            const platformConf = resolver.resolve(match.type)
             try {
-              await sendWithTimeout(session, h.audio(p.musicUrl))
-            } catch {
-              await sendWithTimeout(session, `音乐链接：${p.musicUrl}`).catch(() => {})
+              const parsed = await apiClient.fetch(match.url, match.type, match.id, platformConf)
+              if (dedupEnabled && config.deduplicationInterval > 0) {
+                const fp = contentFingerprint(parsed)
+                if (processedContents.has(fp)) {
+                  debug.log('INFO', `跳过重复内容: ${match.url}`)
+                  return
+                }
+                const lastDedup = contentDedupCache.get(fp)
+                if (lastDedup && (Date.now() - lastDedup < config.deduplicationInterval * 1000)) {
+                  debug.log('INFO', `跳过历史重复内容: ${match.url}`)
+                  return
+                }
+                processedContents.add(fp)
+                contentDedupCache.set(fp, Date.now())
+                dedupCache.set(match.url, Date.now())
+              }
+              const items: ParsedItem[] = [{ text: generateFormattedText(parsed, config.unifiedMessageFormat), parsed, order }]
+              await emitItems(session, items)
+            } catch (error) {
+              const msg = getErrorMessage(error)
+              debug.log('ERROR', `解析失败 ${match.url}: ${msg}`)
+              const displayUrl = match.url.length > 50 ? match.url.slice(0, 50) + '...' : match.url
+              await sendWithTimeout(session, `${texts.parseErrorPrefix}\n${texts.parseErrorItemFormat.replace(/\$\{url\}/g, displayUrl).replace(/\$\{msg\}/g, msg)}`)
             }
-          } else {
-            await sendWithTimeout(session, `音乐链接：${p.musicUrl}`).catch(() => {})
-          }
-          await delay(500)
-        }
+          },
+        })
+      } finally {
+        limiter.release()
+      }
+    })
+    await Promise.all(tasks)
+
+    pending.sort((a, b) => a.order - b.order)
+    for (const task of pending) {
+      try {
+        await task.fn()
+      } catch (error) {
+        debug.log('ERROR', `任务执行失败: ${getErrorMessage(error)}`)
       }
     }
     debug.log('INFO', '处理完成')
@@ -402,15 +539,20 @@ export function apply(ctx: Context, config: Config) {
     if (session.selfId === session.userId) return
     const matches = extractAllUrlsFromMessage(session, customRules)
     if (!matches.length) return
-    debug.log('INFO', `检测到 ${matches.length} 个音乐链接`)
+    const supported = matches.filter(m => m.type.startsWith('custom_') || SUPPORTED_PLATFORMS.includes(m.type as any))
+    if (!supported.length) {
+      debug.log('INFO', '检测到的链接均不受支持')
+      return
+    }
+    debug.log('INFO', `检测到 ${supported.length} 个音乐链接`)
     if (config.showWaitingTip) {
       try {
         await sendWithTimeout(session, texts.waitingTipText)
       } catch (e) {
-        debug.log('WARN', '等待提示发送失败:', e)
+        debug.log('WARN', '等待提示发送失败')
       }
     }
-    await flush(session, matches)
+    await flush(session, supported)
   })
 
   ctx.command('music-parse <url>', '手动解析音乐').action(async ({ session }, url) => {
@@ -423,19 +565,27 @@ export function apply(ctx: Context, config: Config) {
       await sendWithTimeout(session, texts.invalidLinkText)
       return
     }
+    const supported = matches.filter(m => m.type.startsWith('custom_') || SUPPORTED_PLATFORMS.includes(m.type as any))
+    if (!supported.length) {
+      await sendWithTimeout(session, texts.unsupportedPlatformText)
+      return
+    }
     if (config.showWaitingTip) {
       try {
         await sendWithTimeout(session, texts.waitingTipText)
       } catch {}
     }
-    await flush(session, matches)
+    await flush(session, supported)
   })
 
   ctx.on('dispose', () => {
     urlCacheLocal.clear()
+    playlistCacheLocal.clear()
     dedupCache.clear()
     debug.log('INFO', '音乐解析插件已卸载')
   })
 
   debug.log('INFO', '音乐解析插件初始化完成')
 }
+
+export { PLATFORM_LABELS, SUPPORTED_PLATFORMS }

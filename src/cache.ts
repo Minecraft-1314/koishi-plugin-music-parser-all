@@ -6,25 +6,31 @@ export class SimpleLRUCache<V> {
   get(key: string): V | undefined {
     const entry = this.map.get(key)
     if (!entry) return undefined
-    if (Date.now() > entry.expireAt) {
+    if (entry.expireAt <= Date.now()) {
       this.map.delete(key)
       return undefined
     }
+    this.map.delete(key)
+    this.map.set(key, entry)
     return entry.value
   }
 
   set(key: string, value: V): void {
-    this.map.delete(key)
-    while (this.map.size >= this.max) {
-      const oldest = this.map.keys().next().value
-      if (oldest === undefined) break
-      this.map.delete(oldest)
-    }
+    if (this.map.has(key)) this.map.delete(key)
     this.map.set(key, { value, expireAt: Date.now() + this.ttlMs })
+    while (this.map.size > this.max) {
+      const oldest = this.map.keys().next()
+      if (oldest.done) break
+      this.map.delete(oldest.value)
+    }
   }
 
   clear(): void {
     this.map.clear()
+  }
+
+  get size(): number {
+    return this.map.size
   }
 }
 
@@ -32,23 +38,21 @@ export class ConcurrencyLimiter {
   private running = 0
   private queue: (() => void)[] = []
 
-  constructor(private max: number) {}
+  constructor(private max: number) {
+    if (!this.max || this.max < 1) this.max = 1
+  }
 
   async acquire(): Promise<void> {
     if (this.running < this.max) {
       this.running++
       return
     }
-    return new Promise(resolve => {
-      this.queue.push(() => {
-        this.running++
-        resolve()
-      })
-    })
+    await new Promise<void>(resolve => this.queue.push(resolve))
+    this.running++
   }
 
   release(): void {
-    this.running = Math.max(0, this.running - 1)
+    this.running--
     const next = this.queue.shift()
     if (next) next()
   }
